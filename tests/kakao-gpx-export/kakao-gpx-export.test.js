@@ -13,6 +13,7 @@ const {
   escapeXml,
   generateGPX,
   parseKakaoNaviRoute,
+  parseKakaoInternalRoute,
   extractWaypointsFromUrl,
   extractRouteFromGlobal,
   extractRouteFromKakaoMaps,
@@ -55,6 +56,78 @@ const SAMPLE_NAVI_RESPONSE = {
     },
   ],
 };
+
+// Kakao Maps internal API response (from /route/bikeset.json or /route/cars.json).
+// Coordinates are in WCONGNAMUL (easting,northing,elevation pipe-delimited).
+const SAMPLE_INTERNAL_RESPONSE = {
+  resultCode: 'SUCCESS',
+  directions: [
+    {
+      routeMode: 'BIKE_ONLY',
+      routeType: 'BIKE',
+      time: 14292,
+      length: 73319,
+      resultCode: 'SUCCESS',
+      sections: [
+        {
+          resultCode: 'ROUTE_RESULT_SUCCESS',
+          guideList: [
+            {
+              seq: 1,
+              guideCode: 'START',
+              x: 412510.0,
+              y: 1127275.0,
+              link: {
+                points: '412510.0,1127275.0,8.6|412520.0,1127258.0,8.7|412545.0,1127234.0,8.9',
+              },
+            },
+            {
+              seq: 2,
+              guideCode: 'NONE',
+              x: 412545.0,
+              y: 1127234.0,
+              link: {
+                // Duplicate first point should be de-duplicated
+                points: '412545.0,1127234.0,8.9|413119.0,1126678.0,10.4',
+              },
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+// ── Shared test helpers ────────────────────────────────────────────────────
+
+/**
+ * Build a minimal window mock that provides a kakao.maps.Coords implementation
+ * for WCONGNAMUL→WGS84 conversion in tests.
+ *
+ * @param {{ [key: string]: { lat: number, lng: number } }} [coordMap]
+ *   Optional map from "x,y" WCONGNAMUL key to WGS84 {lat, lng}.
+ *   When a key is not found the returned coords default to {lat:0, lng:0}.
+ * @param {object} [extra]  Extra properties to merge onto the returned window mock.
+ */
+function makeMockCoordsWin(coordMap, extra) {
+  return {
+    kakao: {
+      maps: {
+        Coords: jest.fn().mockImplementation(function (x, y) {
+          const key = x + ',' + y;
+          const wgs = (coordMap && coordMap[key]) || { lat: 0, lng: 0 };
+          return {
+            toLatLng: () => ({
+              getLat: () => wgs.lat,
+              getLng: () => wgs.lng,
+            }),
+          };
+        }),
+      },
+    },
+    ...extra,
+  };
+}
 
 // ── escapeXml ─────────────────────────────────────────────────────────────
 
@@ -240,6 +313,96 @@ describe('parseKakaoNaviRoute', () => {
   });
 });
 
+// ── parseKakaoInternalRoute ───────────────────────────────────────────────
+
+describe('parseKakaoInternalRoute', () => {
+  it('returns null for null input', () => {
+    expect(parseKakaoInternalRoute(null, {})).toBeNull();
+  });
+
+  it('returns null when directions array is missing', () => {
+    expect(parseKakaoInternalRoute({}, {})).toBeNull();
+  });
+
+  it('returns null when directions array is empty', () => {
+    expect(parseKakaoInternalRoute({ directions: [] }, {})).toBeNull();
+  });
+
+  it('returns null when kakao.maps.Coords is unavailable', () => {
+    expect(parseKakaoInternalRoute(SAMPLE_INTERNAL_RESPONSE, {})).toBeNull();
+  });
+
+  it('parses link.points and converts WCONGNAMUL to WGS84', () => {
+    const coordMap = {
+      '412510,1127275': { lat: 37.57, lng: 126.61 },
+      '412520,1127258': { lat: 37.56, lng: 126.62 },
+      '412545,1127234': { lat: 37.55, lng: 126.63 },
+      '413119,1126678': { lat: 37.50, lng: 126.70 },
+    };
+    const win = makeMockCoordsWin(coordMap);
+    const points = parseKakaoInternalRoute(SAMPLE_INTERNAL_RESPONSE, win);
+
+    // 4 unique points (duplicate 412545,1127234 at start of 2nd segment is skipped)
+    expect(points).toHaveLength(4);
+    expect(points[0]).toMatchObject({ lat: 37.57, lng: 126.61 });
+    expect(points[3]).toMatchObject({ lat: 37.50, lng: 126.70 });
+  });
+
+  it('includes elevation when provided', () => {
+    const win = makeMockCoordsWin({ '412510,1127275': { lat: 37.57, lng: 126.61 } });
+    const data = {
+      directions: [{
+        sections: [{
+          guideList: [{
+            link: { points: '412510.0,1127275.0,8.6' },
+          }],
+        }],
+      }],
+    };
+    const points = parseKakaoInternalRoute(data, win);
+    expect(points).toHaveLength(1);
+    expect(points[0].ele).toBeCloseTo(8.6);
+  });
+
+  it('deduplicates consecutive identical WCONGNAMUL coordinates', () => {
+    const win = makeMockCoordsWin({
+      '412510,1127275': { lat: 37.57, lng: 126.61 },
+      '412520,1127258': { lat: 37.56, lng: 126.62 },
+    });
+    const data = {
+      directions: [{
+        sections: [{
+          guideList: [
+            { link: { points: '412510.0,1127275.0,8.6|412520.0,1127258.0,8.7' } },
+            // First point of this segment duplicates last of previous — should be skipped
+            { link: { points: '412520.0,1127258.0,8.7|412510.0,1127275.0,8.6' } },
+          ],
+        }],
+      }],
+    };
+    const points = parseKakaoInternalRoute(data, win);
+    // 2 unique points from first segment + 1 new (duplicate of first skipped) from second
+    // = "412510", "412520", then "412510" is new (not same as previous "412520")
+    expect(points).toHaveLength(3);
+  });
+
+  it('skips guide items without a link.points string', () => {
+    const win = makeMockCoordsWin({ '412510,1127275': { lat: 37.57, lng: 126.61 } });
+    const data = {
+      directions: [{
+        sections: [{
+          guideList: [
+            { link: null },
+            { link: { points: '412510.0,1127275.0,8.6' } },
+          ],
+        }],
+      }],
+    };
+    const points = parseKakaoInternalRoute(data, win);
+    expect(points).toHaveLength(1);
+  });
+});
+
 // ── extractWaypointsFromUrl ───────────────────────────────────────────────
 
 describe('extractWaypointsFromUrl', () => {
@@ -419,6 +582,15 @@ describe('collectRoute', () => {
     const points = collectRoute({}, 'https://map.kakao.com/');
     expect(points).toBeNull();
   });
+
+  it('uses internal Kakao route data (CAPTURED_INTERNAL_KEY) when available', () => {
+    const win = makeMockCoordsWin(null, {
+      __kakaoGPXRawRoute: SAMPLE_INTERNAL_RESPONSE,
+    });
+    const points = collectRoute(win, 'https://map.kakao.com/');
+    expect(points).not.toBeNull();
+    expect(points.length).toBeGreaterThan(0);
+  });
 });
 
 // ── looksLikeRouteData ────────────────────────────────────────────────────
@@ -428,13 +600,17 @@ describe('looksLikeRouteData', () => {
     expect(looksLikeRouteData(SAMPLE_NAVI_RESPONSE)).toBe(true);
   });
 
+  it('returns true for a valid Kakao internal API response (directions format)', () => {
+    expect(looksLikeRouteData(SAMPLE_INTERNAL_RESPONSE)).toBe(true);
+  });
+
   it('returns false for non-object values', () => {
     expect(looksLikeRouteData(null)).toBe(false);
     expect(looksLikeRouteData('string')).toBe(false);
     expect(looksLikeRouteData(42)).toBe(false);
   });
 
-  it('returns false when routes is missing', () => {
+  it('returns false when routes is missing and directions is missing', () => {
     expect(looksLikeRouteData({})).toBe(false);
   });
 
@@ -442,8 +618,16 @@ describe('looksLikeRouteData', () => {
     expect(looksLikeRouteData({ routes: [] })).toBe(false);
   });
 
+  it('returns false when directions is empty', () => {
+    expect(looksLikeRouteData({ directions: [] })).toBe(false);
+  });
+
   it('returns false when first route has no sections', () => {
     expect(looksLikeRouteData({ routes: [{}] })).toBe(false);
+  });
+
+  it('returns false when first direction has no sections', () => {
+    expect(looksLikeRouteData({ directions: [{}] })).toBe(false);
   });
 });
 
@@ -484,6 +668,29 @@ describe('installNetworkHook', () => {
 
     expect(win.__kakaoGPXRoute).toBeDefined();
     expect(win.__kakaoGPXRoute.length).toBeGreaterThan(0);
+  });
+
+  it('stores raw internal-format response in win.__kakaoGPXRawRoute on XHR load', () => {
+    const listeners = [];
+    function FakeXHR3() {}
+    FakeXHR3.prototype.open = function () {};
+    FakeXHR3.prototype.addEventListener = function (type, fn) {
+      if (type === 'load') listeners.push(fn);
+    };
+
+    const win = { XMLHttpRequest: FakeXHR3 };
+    installNetworkHook(win);
+
+    const xhr = new FakeXHR3();
+    xhr.open('GET', 'https://map.kakao.com/route/bikeset.json');
+    xhr.status = 200;
+    xhr.responseText = JSON.stringify(SAMPLE_INTERNAL_RESPONSE);
+    listeners.forEach((fn) => fn.call(xhr));
+
+    // The hook re-parses the JSON string, so it's a new object with the same shape.
+    expect(win.__kakaoGPXRawRoute).toStrictEqual(SAMPLE_INTERNAL_RESPONSE);
+    // __kakaoGPXRoute should NOT be set (internal format is not pre-converted)
+    expect(win.__kakaoGPXRoute).toBeUndefined();
   });
 
   it('does not overwrite win.__kakaoGPXRoute for non-route responses', () => {
@@ -532,6 +739,27 @@ describe('installNetworkHook', () => {
 
     expect(win.__kakaoGPXRoute).toBeDefined();
     expect(win.__kakaoGPXRoute.length).toBeGreaterThan(0);
+  });
+
+  it('stores internal format response in __kakaoGPXRawRoute via fetch hook', async () => {
+    const win = {
+      XMLHttpRequest: class {
+        open() {}
+        addEventListener() {}
+      },
+    };
+
+    win.fetch = jest.fn().mockResolvedValue({
+      clone: () => ({
+        json: () => Promise.resolve(SAMPLE_INTERNAL_RESPONSE),
+      }),
+    });
+
+    installNetworkHook(win);
+    await win.fetch('https://map.kakao.com/route/bikeset.json');
+    await Promise.resolve();
+
+    expect(win.__kakaoGPXRawRoute).toBe(SAMPLE_INTERNAL_RESPONSE); // fetch gives the object directly (no re-parse)
   });
 });
 

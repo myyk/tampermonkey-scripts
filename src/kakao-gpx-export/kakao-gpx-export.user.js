@@ -1,17 +1,18 @@
 // ==UserScript==
 // @name         Kakao GPX Export
 // @namespace    https://github.com/myyk/tampermonkey-scripts
-// @version      1.1.0
+// @version      1.2.0
 // @description  Adds an "Export GPX" button to Kakao Maps route pages so you can import the route into Garmin Connect.
 // @author       myyk
 // @match        https://map.kakao.com/*
 // @match        https://m.map.kakao.com/*
 // @match        https://place.map.kakao.com/*
 // @grant        GM_download
+// @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
 
-/* global kakao, GM_download */
+/* global kakao, GM_download, unsafeWindow */
 
 (function (root) {
   'use strict';
@@ -25,8 +26,13 @@
   const POLL_INTERVAL_MS = 500;
   const POLL_MAX_MS = 30000;
 
-  // Key under which XHR-captured route data is stored on the window object.
+  // Key under which XHR-captured WGS84 route data is stored on the window object.
   const CAPTURED_ROUTE_KEY = '__kakaoGPXRoute';
+
+  // Key under which XHR-captured raw Kakao internal route data is stored.
+  // The internal format uses WCONGNAMUL coordinates that are converted lazily
+  // at button-click time (when kakao.maps is guaranteed to be loaded).
+  const CAPTURED_INTERNAL_KEY = '__kakaoGPXRawRoute';
 
   // ── Pure helpers ───────────────────────────────────────────────────────────
 
@@ -122,6 +128,73 @@
         for (var i = 0; i + 1 < v.length; i += 2) {
           points.push({ lng: v[i], lat: v[i + 1] });
         }
+      });
+    });
+
+    return points.length > 0 ? points : null;
+  }
+
+  /**
+   * Parse the Kakao Maps INTERNAL route API format.
+   *
+   * The internal Kakao Maps route endpoints (/route/bikeset.json,
+   * /route/cars.json, etc.) return a payload shaped like:
+   *
+   *   { resultCode, directions: [{ sections: [{ guideList: [{ link: { points: "x,y,ele|x,y,ele|…" } }] }] }] }
+   *
+   * Coordinates are in WCONGNAMUL (a Kakao/Daum map projection). Conversion to
+   * WGS84 is done via the kakao.maps.Coords SDK already loaded on the page.
+   *
+   * @param {object} data  Parsed JSON from the internal route API.
+   * @param {Window} win   Must be the PAGE window (unsafeWindow in Tampermonkey)
+   *                       so that win.kakao.maps.Coords is available.
+   * @returns {Array<{lat:number, lng:number, ele?:number}>|null}
+   */
+  function parseKakaoInternalRoute(data, win) {
+    if (!data || !Array.isArray(data.directions) || !data.directions.length) {
+      return null;
+    }
+
+    var firstDirection = data.directions[0];
+    if (!firstDirection || !Array.isArray(firstDirection.sections)) return null;
+
+    var kakaoMaps = win && win.kakao && win.kakao.maps;
+    var canConvert = kakaoMaps && typeof kakaoMaps.Coords === 'function';
+
+    var points = [];
+    // Deduplicate consecutive identical WCONGNAMUL coordinates before conversion.
+    var lastKey = '';
+
+    firstDirection.sections.forEach(function (section) {
+      if (!Array.isArray(section.guideList)) return;
+      section.guideList.forEach(function (guide) {
+        if (!guide || !guide.link || typeof guide.link.points !== 'string') return;
+
+        // "x,y,ele|x,y,ele|…" — WCONGNAMUL easting/northing + elevation in metres
+        guide.link.points.split('|').forEach(function (segment) {
+          var parts = segment.split(',');
+          if (parts.length < 2) return;
+
+          var x = parseFloat(parts[0]); // WCONGNAMUL easting
+          var y = parseFloat(parts[1]); // WCONGNAMUL northing
+          var ele = parts.length >= 3 ? parseFloat(parts[2]) : null;
+
+          if (!isFinite(x) || !isFinite(y)) return;
+
+          var key = x + ',' + y;
+          if (key === lastKey) return; // Skip duplicate consecutive point
+          lastKey = key;
+
+          if (canConvert) {
+            try {
+              var coords = new kakaoMaps.Coords(x, y);
+              var latlng = coords.toLatLng();
+              var pt = { lat: latlng.getLat(), lng: latlng.getLng() };
+              if (ele !== null && isFinite(ele)) pt.ele = ele;
+              points.push(pt);
+            } catch (e) { /* skip unconvertable points */ }
+          }
+        });
       });
     });
 
@@ -289,26 +362,42 @@
    * Collect all available route data using every extraction strategy.
    * Returns null when no route could be found.
    *
-   * @param {Window}   win
+   * Priority order:
+   *  1. XHR-captured WGS84 route (public Navi API, already converted)
+   *  2. XHR-captured raw internal Kakao Maps route (converted lazily here)
+   *  3. Global state (window.routeData, __NEXT_DATA__, etc.)
+   *  4. Live kakao.maps Polyline objects from the map instance
+   *  5. og:image meta-tag start/end WCONGNAMUL markers
+   *  6. URL /link/route/ waypoints
+   *
+   * @param {Window}   win  Should be the page window (unsafeWindow in Tampermonkey).
    * @param {string}   [url]
    * @param {Document} [doc]
    * @returns {Array<{lat:number, lng:number}>|null}
    */
   function collectRoute(win, url, doc) {
-    // 1. XHR-intercepted + other global state (most reliable).
+    // 1. XHR-captured pre-converted WGS84 route (public Navi API).
     var fromGlobal = extractRouteFromGlobal(win);
     if (fromGlobal) return fromGlobal;
 
-    // 2. Live kakao.maps Polyline objects.
+    // 2. XHR-captured raw internal Kakao Maps route (needs WCONGNAMUL→WGS84 conversion).
+    //    kakao.maps.Coords is available because the map is loaded before any route
+    //    API response can be captured.
+    if (win && win[CAPTURED_INTERNAL_KEY]) {
+      var fromInternal = parseKakaoInternalRoute(win[CAPTURED_INTERNAL_KEY], win);
+      if (fromInternal) return fromInternal;
+    }
+
+    // 3. Live kakao.maps Polyline objects.
     var fromMaps = extractRouteFromKakaoMaps(win);
     if (fromMaps) return fromMaps;
 
-    // 3. og:image meta tag (start/end points from Kakao share pages).
+    // 4. og:image meta tag (start/end points from Kakao share pages).
     var resolvedDoc = doc || (typeof document !== 'undefined' ? document : null);
     var fromMeta = extractRouteFromMetaTags(resolvedDoc, win);
     if (fromMeta) return fromMeta;
 
-    // 4. URL path parsing (only waypoints, but better than nothing).
+    // 5. URL path parsing (only waypoints, but better than nothing).
     var currentUrl = url || (win && win.location && win.location.href) || '';
     var fromUrl = extractWaypointsFromUrl(currentUrl);
     if (fromUrl) return fromUrl;
@@ -452,14 +541,25 @@
    * Check whether a parsed JSON object looks like a Kakao route API response
    * with extractable coordinate data.
    *
+   * Supports two formats:
+   *  - Public Kakao Navi API: { routes: [{ sections: [...] }] }
+   *  - Internal Kakao Maps API (bikeset.json / cars.json):
+   *      { directions: [{ sections: [...] }] }
+   *
    * @param {unknown} data
    * @returns {boolean}
    */
   function looksLikeRouteData(data) {
     if (!data || typeof data !== 'object') return false;
+    // Public Kakao Navi API format
     if (Array.isArray(data.routes) && data.routes.length > 0) {
       var r = data.routes[0];
       return r && Array.isArray(r.sections);
+    }
+    // Internal Kakao Maps API format (bikeset.json, cars.json, walkset.json)
+    if (Array.isArray(data.directions) && data.directions.length > 0) {
+      var d = data.directions[0];
+      return d && Array.isArray(d.sections);
     }
     return false;
   }
@@ -485,8 +585,16 @@
           try {
             var data = JSON.parse(this.responseText);
             if (looksLikeRouteData(data)) {
-              var points = parseKakaoNaviRoute(data);
-              if (points) win[CAPTURED_ROUTE_KEY] = points;
+              // Public Navi API format: parse and convert immediately to WGS84 points.
+              if (Array.isArray(data.routes)) {
+                var points = parseKakaoNaviRoute(data);
+                if (points) win[CAPTURED_ROUTE_KEY] = points;
+              }
+              // Internal Kakao Maps API format: store raw data; WCONGNAMUL→WGS84
+              // conversion happens lazily at button-click time via kakao.maps.Coords.
+              if (Array.isArray(data.directions)) {
+                win[CAPTURED_INTERNAL_KEY] = data;
+              }
             }
           } catch (e) {
             // Probing ALL XHR responses for route data; non-JSON is expected and normal.
@@ -504,8 +612,13 @@
         return p.then(function (response) {
           response.clone().json().then(function (data) {
             if (looksLikeRouteData(data)) {
-              var points = parseKakaoNaviRoute(data);
-              if (points) win[CAPTURED_ROUTE_KEY] = points;
+              if (Array.isArray(data.routes)) {
+                var points = parseKakaoNaviRoute(data);
+                if (points) win[CAPTURED_ROUTE_KEY] = points;
+              }
+              if (Array.isArray(data.directions)) {
+                win[CAPTURED_INTERNAL_KEY] = data;
+              }
             }
           }).catch(function () {
             // Probing ALL fetch responses for route data; non-JSON is expected and normal.
@@ -542,17 +655,26 @@
 
   // ── Entry point (browser only) ─────────────────────────────────────────────
   // When running under Tampermonkey in a real browser, `module` is not defined.
+  //
+  // IMPORTANT: Tampermonkey scripts with any @grant directive run in an isolated
+  // sandbox whose `window` is NOT the page's window. To intercept the page's
+  // XHR/fetch calls we must patch `unsafeWindow.XMLHttpRequest.prototype`, not
+  // the sandbox's `window.XMLHttpRequest`. Similarly, `unsafeWindow.kakao.maps`
+  // is needed to access the coordinate-conversion API loaded by the page.
+  //
   // We install the network hook immediately (document-start) so it is in place
   // before the page makes route API requests, then defer button injection until
   // the DOM is ready.
   // When running under Jest, `module` IS defined and tests control execution.
 
   if (typeof module === 'undefined') {
-    installNetworkHook(root);
+    // Use the page's real window when available (Tampermonkey sandbox context).
+    var pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : root;
+    installNetworkHook(pageWindow);
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', function () { init(); });
+      document.addEventListener('DOMContentLoaded', function () { init(document, pageWindow); });
     } else {
-      init();
+      init(document, pageWindow);
     }
   }
 
@@ -563,6 +685,7 @@
       escapeXml,
       generateGPX,
       parseKakaoNaviRoute,
+      parseKakaoInternalRoute,
       extractWaypointsFromUrl,
       extractRouteFromGlobal,
       extractRouteFromKakaoMaps,
