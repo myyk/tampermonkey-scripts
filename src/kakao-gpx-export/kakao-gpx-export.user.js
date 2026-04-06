@@ -476,33 +476,37 @@
 
   /**
    * Download a GPX string as a file.
-   * Uses GM_download when available, falling back to a temporary <a> element.
+   *
+   * Uses a data URI so the download works regardless of execution context
+   * (Tampermonkey sandbox, extension background page, plain page script).
+   * Blob URLs created inside the Tampermonkey sandbox are scoped to the
+   * extension context and cannot be consumed by GM_download's background
+   * downloader, causing a silent failure.  Data URIs are self-contained
+   * strings that work everywhere.
    *
    * @param {string} gpxContent
    * @param {string} [filename]
    */
   function downloadGPX(gpxContent, filename) {
     var fname = filename || 'kakao-route.gpx';
+    var dataUri =
+      'data:application/gpx+xml;charset=utf-8,' +
+      encodeURIComponent(gpxContent);
 
     if (typeof GM_download === 'function') {
-      var blob = new Blob([gpxContent], { type: 'application/gpx+xml' });
-      var url = URL.createObjectURL(blob);
-      GM_download(url, fname);
-      // Revoke after a short delay to let the download start.
-      setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+      console.log('[Kakao GPX] triggering download via GM_download');
+      GM_download(dataUri, fname);
       return;
     }
 
-    // Fallback: create a temporary anchor element.
-    var blob2 = new Blob([gpxContent], { type: 'application/gpx+xml' });
-    var url2 = URL.createObjectURL(blob2);
+    // Fallback: anchor-element click in the page context.
+    console.log('[Kakao GPX] triggering download via anchor element');
     var a = document.createElement('a');
-    a.href = url2;
+    a.href = dataUri;
     a.download = fname;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    setTimeout(function () { URL.revokeObjectURL(url2); }, 10000);
   }
 
   // ── Button injection ───────────────────────────────────────────────────────
@@ -518,16 +522,28 @@
     if (doc.getElementById(BUTTON_ID)) return; // already present
 
     var btn = createExportButton(doc, function handleClick() {
-      var points = collectRoute(win, win.location && win.location.href, doc);
-      if (!points || points.length === 0) {
-        alert(
-          'Kakao GPX Export: No route data found on this page.\n' +
-            'Please open a route or directions page on Kakao Maps.'
+      console.log('[Kakao GPX] Export button clicked');
+      try {
+        var url = (win.location && win.location.href) || '';
+        var points = collectRoute(win, url, doc);
+        console.log(
+          '[Kakao GPX] collectRoute:',
+          points ? points.length + ' point(s) found' : 'no data'
         );
-        return;
+        if (!points || points.length === 0) {
+          alert(
+            'Kakao GPX Export: No route data found on this page.\n' +
+              'Please open a route or directions page on Kakao Maps.'
+          );
+          return;
+        }
+        var gpx = generateGPX(points, { name: doc.title || 'Kakao Route' });
+        console.log('[Kakao GPX] GPX generated (' + gpx.length + ' chars), downloading...');
+        downloadGPX(gpx, 'kakao-route.gpx');
+      } catch (err) {
+        console.error('[Kakao GPX] Error in export handler:', err);
+        alert('Kakao GPX Export: An error occurred – ' + (err && err.message ? err.message : String(err)));
       }
-      var gpx = generateGPX(points, { name: doc.title || 'Kakao Route' });
-      downloadGPX(gpx, 'kakao-route.gpx');
     });
 
     // The button is position:fixed, so appending to body is correct regardless
