@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         Kakao GPX Export
 // @namespace    https://github.com/myyk/tampermonkey-scripts
-// @version      1.0.0
+// @version      1.1.0
 // @description  Adds an "Export GPX" button to Kakao Maps route pages so you can import the route into Garmin Connect.
 // @author       myyk
 // @match        https://map.kakao.com/*
 // @match        https://m.map.kakao.com/*
 // @match        https://place.map.kakao.com/*
 // @grant        GM_download
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 /* global kakao, GM_download */
@@ -24,6 +24,9 @@
   const GPX_SCHEMA = 'http://www.topografix.com/GPX/1/1/gpx.xsd';
   const POLL_INTERVAL_MS = 500;
   const POLL_MAX_MS = 30000;
+
+  // Key under which XHR-captured route data is stored on the window object.
+  const CAPTURED_ROUTE_KEY = '__kakaoGPXRoute';
 
   // ── Pure helpers ───────────────────────────────────────────────────────────
 
@@ -156,13 +159,17 @@
 
   /**
    * Try to read route data from well-known global state locations set by the
-   * Kakao Maps page (Next.js, plain global variables, etc.).
+   * Kakao Maps page (Next.js, plain global variables, etc.) or from XHR
+   * responses that were captured by the network hook.
    *
    * @param {Window} win
    * @returns {Array<{lat:number, lng:number}>|null}
    */
   function extractRouteFromGlobal(win) {
     if (!win) return null;
+
+    // XHR-intercepted route data (stored by installNetworkHook).
+    if (win[CAPTURED_ROUTE_KEY]) return win[CAPTURED_ROUTE_KEY];
 
     // Kakao Navi API response stored directly.
     if (win.routeData) {
@@ -234,23 +241,74 @@
   }
 
   /**
+   * Extract start/end points from the Open Graph image tag.
+   *
+   * Kakao Maps share pages embed start and end marker coordinates in
+   * the og:image URL using WCONGNAMUL (the Kakao/Daum coordinate system):
+   *   …&markers=…|location:412488.07,1127252.97&markers=…|location:548385.01,…
+   *
+   * If the kakao.maps.Coords API is available those coordinates are converted
+   * to WGS84; otherwise only points that can be converted are returned.
+   *
+   * @param {Document} doc
+   * @param {Window}   win
+   * @returns {Array<{lat:number, lng:number}>|null}
+   */
+  function extractRouteFromMetaTags(doc, win) {
+    if (!doc) return null;
+
+    var ogImage = doc.querySelector('meta[property="og:image"]');
+    if (!ogImage) return null;
+
+    var content = ogImage.getAttribute('content') || '';
+    // Each marker segment looks like: markers=…|location:x,y
+    var markerRe = /location:([0-9.]+),([0-9.]+)/g;
+    var points = [];
+    var match;
+
+    while ((match = markerRe.exec(content)) !== null) {
+      var x = parseFloat(match[1]);
+      var y = parseFloat(match[2]);
+
+      // Convert WCONGNAMUL → WGS84 using the kakao.maps SDK loaded on the page.
+      if (win && win.kakao && win.kakao.maps && win.kakao.maps.Coords) {
+        try {
+          var coords = new win.kakao.maps.Coords(x, y);
+          var latlng = coords.toLatLng();
+          points.push({ lat: latlng.getLat(), lng: latlng.getLng() });
+          continue;
+        } catch (e) { /* conversion error – skip this point */ }
+      }
+      // kakao.maps not available or conversion failed — skip (can't convert without the library).
+    }
+
+    return points.length >= 2 ? points : null;
+  }
+
+  /**
    * Collect all available route data using every extraction strategy.
    * Returns null when no route could be found.
    *
-   * @param {Window} win
-   * @param {string} [url]
+   * @param {Window}   win
+   * @param {string}   [url]
+   * @param {Document} [doc]
    * @returns {Array<{lat:number, lng:number}>|null}
    */
-  function collectRoute(win, url) {
-    // 1. Global state (most reliable when the page stores its own data).
+  function collectRoute(win, url, doc) {
+    // 1. XHR-intercepted + other global state (most reliable).
     var fromGlobal = extractRouteFromGlobal(win);
     if (fromGlobal) return fromGlobal;
 
-    // 2. Live kakao.maps objects.
+    // 2. Live kakao.maps Polyline objects.
     var fromMaps = extractRouteFromKakaoMaps(win);
     if (fromMaps) return fromMaps;
 
-    // 3. URL (only waypoints, but better than nothing).
+    // 3. og:image meta tag (start/end points from Kakao share pages).
+    var resolvedDoc = doc || (typeof document !== 'undefined' ? document : null);
+    var fromMeta = extractRouteFromMetaTags(resolvedDoc, win);
+    if (fromMeta) return fromMeta;
+
+    // 4. URL path parsing (only waypoints, but better than nothing).
     var currentUrl = url || (win && win.location && win.location.href) || '';
     var fromUrl = extractWaypointsFromUrl(currentUrl);
     if (fromUrl) return fromUrl;
@@ -262,6 +320,8 @@
 
   /**
    * Create and return the export button element.
+   * The button is fixed-position so it is always visible on top of the map
+   * regardless of where in the DOM it is attached.
    *
    * @param {Document} doc
    * @param {function} onClick
@@ -273,11 +333,13 @@
     btn.textContent = 'Export GPX';
     btn.title = 'Export route as GPX for Garmin Connect';
     btn.style.cssText = [
+      'position:fixed',
+      'bottom:80px',
+      'right:16px',
       'display:inline-flex',
       'align-items:center',
       'gap:4px',
-      'padding:6px 12px',
-      'margin:4px',
+      'padding:8px 16px',
       'background:#3396f4',
       'color:#fff',
       'border:none',
@@ -286,6 +348,7 @@
       'font-weight:600',
       'cursor:pointer',
       'z-index:9999',
+      'box-shadow:0 2px 8px rgba(0,0,0,0.35)',
     ].join(';');
     btn.addEventListener('click', onClick);
     return btn;
@@ -365,9 +428,8 @@
   function addExportButton(doc, win) {
     if (doc.getElementById(BUTTON_ID)) return; // already present
 
-    var container = findButtonContainer(doc);
     var btn = createExportButton(doc, function handleClick() {
-      var points = collectRoute(win, win.location && win.location.href);
+      var points = collectRoute(win, win.location && win.location.href, doc);
       if (!points || points.length === 0) {
         alert(
           'Kakao GPX Export: No route data found on this page.\n' +
@@ -379,7 +441,79 @@
       downloadGPX(gpx, 'kakao-route.gpx');
     });
 
-    container.insertBefore(btn, container.firstChild);
+    // The button is position:fixed, so appending to body is correct regardless
+    // of where we insert it in the DOM.
+    doc.body.appendChild(btn);
+  }
+
+  // ── Network hook ───────────────────────────────────────────────────────────
+
+  /**
+   * Check whether a parsed JSON object looks like a Kakao route API response
+   * with extractable coordinate data.
+   *
+   * @param {unknown} data
+   * @returns {boolean}
+   */
+  function looksLikeRouteData(data) {
+    if (!data || typeof data !== 'object') return false;
+    if (Array.isArray(data.routes) && data.routes.length > 0) {
+      var r = data.routes[0];
+      return r && Array.isArray(r.sections);
+    }
+    return false;
+  }
+
+  /**
+   * Install hooks on XMLHttpRequest and fetch so that any JSON response that
+   * looks like a Kakao route API payload is stored on the window object under
+   * CAPTURED_ROUTE_KEY.
+   *
+   * This must be called at document-start (before page scripts run) so that
+   * it is in place when the route API request is made.
+   *
+   * @param {Window} win
+   */
+  function installNetworkHook(win) {
+    if (!win || !win.XMLHttpRequest) return;
+
+    // ── XHR hook ──────────────────────────────────────────────────────────
+    var OrigOpen = win.XMLHttpRequest.prototype.open;
+    win.XMLHttpRequest.prototype.open = function () {
+      this.addEventListener('load', function () {
+        if (this.status >= 200 && this.status < 300) {
+          try {
+            var data = JSON.parse(this.responseText);
+            if (looksLikeRouteData(data)) {
+              var points = parseKakaoNaviRoute(data);
+              if (points) win[CAPTURED_ROUTE_KEY] = points;
+            }
+          } catch (e) {
+            // Probing ALL XHR responses for route data; non-JSON is expected and normal.
+          }
+        }
+      });
+      return OrigOpen.apply(this, arguments);
+    };
+
+    // ── Fetch hook ────────────────────────────────────────────────────────
+    if (typeof win.fetch === 'function') {
+      var origFetch = win.fetch;
+      win.fetch = function () {
+        var p = origFetch.apply(win, arguments);
+        return p.then(function (response) {
+          response.clone().json().then(function (data) {
+            if (looksLikeRouteData(data)) {
+              var points = parseKakaoNaviRoute(data);
+              if (points) win[CAPTURED_ROUTE_KEY] = points;
+            }
+          }).catch(function () {
+            // Probing ALL fetch responses for route data; non-JSON is expected and normal.
+          });
+          return response;
+        });
+      };
+    }
   }
 
   // ── Initialisation ─────────────────────────────────────────────────────────
@@ -407,12 +541,19 @@
   }
 
   // ── Entry point (browser only) ─────────────────────────────────────────────
-  // When running under Tampermonkey in a real browser, `module` is not defined,
-  // so we call init() automatically.  When running under Jest, `module` IS
-  // defined and the test file controls execution.
+  // When running under Tampermonkey in a real browser, `module` is not defined.
+  // We install the network hook immediately (document-start) so it is in place
+  // before the page makes route API requests, then defer button injection until
+  // the DOM is ready.
+  // When running under Jest, `module` IS defined and tests control execution.
 
   if (typeof module === 'undefined') {
-    init();
+    installNetworkHook(root);
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', function () { init(); });
+    } else {
+      init();
+    }
   }
 
   // ── CommonJS exports (for Jest) ────────────────────────────────────────────
@@ -425,11 +566,14 @@
       extractWaypointsFromUrl,
       extractRouteFromGlobal,
       extractRouteFromKakaoMaps,
+      extractRouteFromMetaTags,
       collectRoute,
       createExportButton,
       findButtonContainer,
       downloadGPX,
       addExportButton,
+      looksLikeRouteData,
+      installNetworkHook,
       init,
     };
   }

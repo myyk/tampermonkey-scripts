@@ -16,11 +16,14 @@ const {
   extractWaypointsFromUrl,
   extractRouteFromGlobal,
   extractRouteFromKakaoMaps,
+  extractRouteFromMetaTags,
   collectRoute,
   findButtonContainer,
   createExportButton,
   addExportButton,
   downloadGPX,
+  looksLikeRouteData,
+  installNetworkHook,
 } = require('../../src/kakao-gpx-export/kakao-gpx-export.user.js');
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
@@ -301,6 +304,12 @@ describe('extractWaypointsFromUrl', () => {
 // ── extractRouteFromGlobal ───────────────────────────────────────────────
 
 describe('extractRouteFromGlobal', () => {
+  it('reads XHR-captured route from window.__kakaoGPXRoute', () => {
+    const win = { __kakaoGPXRoute: SAMPLE_POINTS };
+    const points = extractRouteFromGlobal(win);
+    expect(points).toBe(SAMPLE_POINTS);
+  });
+
   it('reads routeData from window.routeData', () => {
     const win = { routeData: SAMPLE_NAVI_RESPONSE };
     const points = extractRouteFromGlobal(win);
@@ -379,6 +388,15 @@ describe('extractRouteFromKakaoMaps', () => {
 // ── collectRoute ──────────────────────────────────────────────────────────
 
 describe('collectRoute', () => {
+  it('prefers XHR-captured route (__kakaoGPXRoute) over everything else', () => {
+    const win = {
+      __kakaoGPXRoute: SAMPLE_POINTS,
+      routeData: SAMPLE_NAVI_RESPONSE,
+    };
+    const points = collectRoute(win, 'https://map.kakao.com/link/route/A,37.1,127.1/B,37.2,127.2');
+    expect(points).toBe(SAMPLE_POINTS);
+  });
+
   it('prefers global state over URL', () => {
     const win = { routeData: SAMPLE_NAVI_RESPONSE };
     const url =
@@ -400,6 +418,182 @@ describe('collectRoute', () => {
   it('returns null when nothing is available', () => {
     const points = collectRoute({}, 'https://map.kakao.com/');
     expect(points).toBeNull();
+  });
+});
+
+// ── looksLikeRouteData ────────────────────────────────────────────────────
+
+describe('looksLikeRouteData', () => {
+  it('returns true for a valid Kakao Navi API response', () => {
+    expect(looksLikeRouteData(SAMPLE_NAVI_RESPONSE)).toBe(true);
+  });
+
+  it('returns false for non-object values', () => {
+    expect(looksLikeRouteData(null)).toBe(false);
+    expect(looksLikeRouteData('string')).toBe(false);
+    expect(looksLikeRouteData(42)).toBe(false);
+  });
+
+  it('returns false when routes is missing', () => {
+    expect(looksLikeRouteData({})).toBe(false);
+  });
+
+  it('returns false when routes is empty', () => {
+    expect(looksLikeRouteData({ routes: [] })).toBe(false);
+  });
+
+  it('returns false when first route has no sections', () => {
+    expect(looksLikeRouteData({ routes: [{}] })).toBe(false);
+  });
+});
+
+// ── installNetworkHook ────────────────────────────────────────────────────
+
+describe('installNetworkHook', () => {
+  it('does nothing when win is null', () => {
+    expect(() => installNetworkHook(null)).not.toThrow();
+  });
+
+  it('does nothing when XMLHttpRequest is absent', () => {
+    expect(() => installNetworkHook({})).not.toThrow();
+  });
+
+  it('stores parsed route in win.__kakaoGPXRoute on XHR load', () => {
+    // Build a minimal fake XHR that synchronously fires a load event.
+    const listeners = [];
+    function FakeXHR() {}
+    FakeXHR.prototype.open = function () {};
+    FakeXHR.prototype.addEventListener = function (type, fn) {
+      if (type === 'load') listeners.push(fn);
+    };
+    FakeXHR.prototype.send = function () {};
+
+    const win = { XMLHttpRequest: FakeXHR };
+    installNetworkHook(win);
+
+    // Simulate an XHR instance opening a request.
+    const xhr = new FakeXHR();
+    xhr.open('GET', 'https://apis-navi.kakaomobility.com/v1/directions');
+
+    // Simulate a successful response with route data.
+    xhr.status = 200;
+    xhr.responseText = JSON.stringify(SAMPLE_NAVI_RESPONSE);
+
+    // Fire all registered load listeners.
+    listeners.forEach((fn) => fn.call(xhr));
+
+    expect(win.__kakaoGPXRoute).toBeDefined();
+    expect(win.__kakaoGPXRoute.length).toBeGreaterThan(0);
+  });
+
+  it('does not overwrite win.__kakaoGPXRoute for non-route responses', () => {
+    const listeners = [];
+    function FakeXHR2() {}
+    FakeXHR2.prototype.open = function () {};
+    FakeXHR2.prototype.addEventListener = function (type, fn) {
+      if (type === 'load') listeners.push(fn);
+    };
+
+    const win = { XMLHttpRequest: FakeXHR2, __kakaoGPXRoute: SAMPLE_POINTS };
+    installNetworkHook(win);
+
+    const xhr = new FakeXHR2();
+    xhr.open('GET', 'https://example.com/api/other');
+    xhr.status = 200;
+    xhr.responseText = JSON.stringify({ data: 'not a route' });
+    listeners.forEach((fn) => fn.call(xhr));
+
+    // Should remain unchanged.
+    expect(win.__kakaoGPXRoute).toBe(SAMPLE_POINTS);
+  });
+
+  it('stores parsed route from fetch response', async () => {
+    const win = {
+      XMLHttpRequest: class {
+        open() {}
+        addEventListener() {}
+      },
+    };
+
+    // Provide a fake fetch that resolves with the route response.
+    win.fetch = jest.fn().mockResolvedValue({
+      clone: () => ({
+        json: () => Promise.resolve(SAMPLE_NAVI_RESPONSE),
+      }),
+    });
+
+    installNetworkHook(win);
+
+    // Trigger the hooked fetch.
+    await win.fetch('https://apis-navi.kakaomobility.com/v1/directions');
+
+    // Give the .then() chain a tick to resolve.
+    await Promise.resolve();
+
+    expect(win.__kakaoGPXRoute).toBeDefined();
+    expect(win.__kakaoGPXRoute.length).toBeGreaterThan(0);
+  });
+});
+
+// ── extractRouteFromMetaTags ──────────────────────────────────────────────
+
+describe('extractRouteFromMetaTags', () => {
+  const OG_IMAGE_WITH_MARKERS =
+    'http://ssl.daumcdn.net/map3/staticmap/image?srs=WCONGNAMUL' +
+    '&markers=symbol:route_start_marker%7Clocation:412488.07,1127252.97' +
+    '&markers=symbol:route_end_marker%7Clocation:548385.01,1124839.94';
+
+  it('returns null when doc is null', () => {
+    expect(extractRouteFromMetaTags(null, {})).toBeNull();
+  });
+
+  it('returns null when og:image meta tag is absent', () => {
+    document.body.innerHTML = '';
+    expect(extractRouteFromMetaTags(document, {})).toBeNull();
+  });
+
+  it('returns null when og:image has no location markers', () => {
+    document.head.innerHTML =
+      '<meta property="og:image" content="http://example.com/image.png">';
+    expect(extractRouteFromMetaTags(document, {})).toBeNull();
+  });
+
+  it('returns null when only one marker is present (need ≥ 2)', () => {
+    document.head.innerHTML =
+      '<meta property="og:image" content="http://example.com/?location:1.0,2.0">';
+    expect(extractRouteFromMetaTags(document, {})).toBeNull();
+  });
+
+  it('returns converted points when kakao.maps.Coords is available', () => {
+    document.head.innerHTML =
+      `<meta property="og:image" content="${OG_IMAGE_WITH_MARKERS}">`;
+
+    const mockToLatLng = jest
+      .fn()
+      .mockReturnValueOnce({ getLat: () => 37.57, getLng: () => 126.61 })
+      .mockReturnValueOnce({ getLat: () => 37.45, getLng: () => 127.14 });
+
+    const mockCoordsConstructor = jest.fn().mockImplementation(() => ({
+      toLatLng: mockToLatLng,
+    }));
+
+    const win = {
+      kakao: { maps: { Coords: mockCoordsConstructor } },
+    };
+
+    const points = extractRouteFromMetaTags(document, win);
+    expect(points).toHaveLength(2);
+    expect(points[0]).toEqual({ lat: 37.57, lng: 126.61 });
+    expect(points[1]).toEqual({ lat: 37.45, lng: 127.14 });
+    expect(mockCoordsConstructor).toHaveBeenCalledWith(412488.07, 1127252.97);
+    expect(mockCoordsConstructor).toHaveBeenCalledWith(548385.01, 1124839.94);
+  });
+
+  it('returns null when kakao.maps.Coords is unavailable', () => {
+    document.head.innerHTML =
+      `<meta property="og:image" content="${OG_IMAGE_WITH_MARKERS}">`;
+    // No kakao.maps available → can't convert WCONGNAMUL → WGS84
+    expect(extractRouteFromMetaTags(document, {})).toBeNull();
   });
 });
 
@@ -430,6 +624,11 @@ describe('createExportButton', () => {
     expect(btn.textContent).toBe('Export GPX');
   });
 
+  it('uses position:fixed so it is always visible above map layers', () => {
+    const btn = createExportButton(document, () => {});
+    expect(btn.style.position).toBe('fixed');
+  });
+
   it('fires the onClick callback when clicked', () => {
     const onClick = jest.fn();
     const btn = createExportButton(document, onClick);
@@ -458,12 +657,11 @@ describe('addExportButton', () => {
     expect(buttons.length).toBe(1);
   });
 
-  it('places the button inside a .route_result container when present', () => {
-    document.body.innerHTML = '<div class="route_result"></div>';
+  it('appends the button to body (position:fixed so DOM location does not matter)', () => {
+    document.body.innerHTML = '';
     const win = {};
     addExportButton(document, win);
-    const container = document.querySelector('.route_result');
-    expect(container.querySelector('#kakao-gpx-export-btn')).not.toBeNull();
+    expect(document.body.querySelector('#kakao-gpx-export-btn')).not.toBeNull();
   });
 });
 
@@ -528,7 +726,7 @@ describe('Integration: Export GPX button click', () => {
     global.URL.revokeObjectURL = jest.fn();
     global.alert = jest.fn();
 
-    document.body.innerHTML = '<div class="route_result"></div>';
+    document.body.innerHTML = '';
   });
 
   afterEach(() => {
@@ -537,6 +735,19 @@ describe('Integration: Export GPX button click', () => {
 
   it('downloads a GPX file when route data is available in global state', () => {
     const win = { routeData: SAMPLE_NAVI_RESPONSE };
+    Object.defineProperty(win, 'location', {
+      value: { href: 'https://map.kakao.com/' },
+    });
+
+    addExportButton(document, win);
+    document.getElementById('kakao-gpx-export-btn').click();
+
+    expect(tm.downloads).toHaveLength(1);
+    expect(tm.downloads[0].filename).toBe('kakao-route.gpx');
+  });
+
+  it('downloads a GPX file when route is captured via XHR hook', () => {
+    const win = { __kakaoGPXRoute: SAMPLE_POINTS };
     Object.defineProperty(win, 'location', {
       value: { href: 'https://map.kakao.com/' },
     });
