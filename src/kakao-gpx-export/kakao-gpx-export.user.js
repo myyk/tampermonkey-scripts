@@ -7,12 +7,11 @@
 // @match        https://map.kakao.com/*
 // @match        https://m.map.kakao.com/*
 // @match        https://place.map.kakao.com/*
-// @grant        GM_download
 // @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
 
-/* global kakao, GM_download, unsafeWindow */
+/* global kakao, unsafeWindow */
 
 (function (root) {
   'use strict';
@@ -475,14 +474,19 @@
   }
 
   /**
-   * Download a GPX string as a file.
+   * Download a GPX string as a file via a temporary <a download> element.
    *
-   * Uses a data URI so the download works regardless of execution context
-   * (Tampermonkey sandbox, extension background page, plain page script).
-   * Blob URLs created inside the Tampermonkey sandbox are scoped to the
-   * extension context and cannot be consumed by GM_download's background
-   * downloader, causing a silent failure.  Data URIs are self-contained
-   * strings that work everywhere.
+   * This is the most reliable mechanism for locally-generated content.
+   * GM_download is designed for cross-origin URLs and silently fails with
+   * data URIs in many Tampermonkey versions — the browser download API it
+   * delegates to either rejects or ignores data-scheme URLs from an
+   * extension context.  Blob URLs are equally unreliable because they are
+   * scoped to the sandbox context and inaccessible to the browser download
+   * manager.
+   *
+   * The <a download> element is created in the page DOM (Tampermonkey
+   * shares DOM access even in its sandbox) and works for any data URI
+   * regardless of context.
    *
    * @param {string} gpxContent
    * @param {string} [filename]
@@ -493,17 +497,11 @@
       'data:application/gpx+xml;charset=utf-8,' +
       encodeURIComponent(gpxContent);
 
-    if (typeof GM_download === 'function') {
-      console.log('[Kakao GPX] triggering download via GM_download');
-      GM_download(dataUri, fname);
-      return;
-    }
-
-    // Fallback: anchor-element click in the page context.
     console.log('[Kakao GPX] triggering download via anchor element');
     var a = document.createElement('a');
     a.href = dataUri;
     a.download = fname;
+    a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

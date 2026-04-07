@@ -104,6 +104,24 @@ var lng = latlng.getLng();
 
 Use `position: fixed; bottom: 80px; right: 16px; z-index: 9999` on the button. Append it to `document.body`. A `static` or `relative` position causes the button to be occluded by the absolutely-positioned map container.
 
+### Download mechanism (CRITICAL)
+
+**Never use `GM_download` for locally-generated content.** `GM_download` delegates to the browser's download API via the extension background page. Both blob URLs and data URIs silently fail in many Tampermonkey versions / browser configurations — the extension background context cannot access sandbox-scoped blob URLs, and data URIs are rejected or silently ignored by `chrome.downloads.download()`.
+
+**Use a temporary `<a download>` element instead:**
+
+```js
+var a = document.createElement('a');
+a.href = 'data:application/gpx+xml;charset=utf-8,' + encodeURIComponent(content);
+a.download = 'kakao-route.gpx';
+a.style.display = 'none';
+document.body.appendChild(a);
+a.click();
+document.body.removeChild(a);
+```
+
+This works because Tampermonkey shares DOM access — `document.createElement('a')` creates an element in the page's real DOM even from the sandbox. The browser handles the data URI download natively.
+
 ### Domain access
 
 The domains `map.kakao.com`, `kko.to`, `t1.kakaocdn.net`, `ssl.daumcdn.net`, and `apis.map.kakao.com` are whitelisted for agent network access. Use `curl -sL` to inspect pages and APIs during investigation.

@@ -896,66 +896,87 @@ describe('addExportButton', () => {
 // ── downloadGPX ──────────────────────────────────────────────────────────
 
 describe('downloadGPX', () => {
-  let tm;
+  let appendSpy;
+  let removeSpy;
+  let clickSpy;
 
   beforeEach(() => {
-    tm = new TampermonkeyMock();
-    tm.install();
+    appendSpy = jest.spyOn(document.body, 'appendChild');
+    removeSpy = jest.spyOn(document.body, 'removeChild');
+    clickSpy = jest.fn();
+    // Spy on anchor click by intercepting createElement.
+    jest.spyOn(document, 'createElement').mockImplementation((tag) => {
+      const el = document.implementation.createHTMLDocument().createElement(tag);
+      if (tag === 'a') {
+        el.click = clickSpy;
+      }
+      return el;
+    });
   });
 
   afterEach(() => {
-    tm.uninstall();
+    appendSpy.mockRestore();
+    removeSpy.mockRestore();
+    document.createElement.mockRestore();
   });
 
-  it('calls GM_download with a data URI and the given filename', () => {
+  it('creates an <a download> element with a data URI and the given filename', () => {
     const gpx = generateGPX(SAMPLE_POINTS);
     downloadGPX(gpx, 'my-route.gpx');
 
-    expect(tm.downloads).toHaveLength(1);
-    expect(tm.downloads[0].url).toMatch(/^data:application\/gpx\+xml;charset=utf-8,/);
-    expect(tm.downloads[0].filename).toBe('my-route.gpx');
+    expect(appendSpy).toHaveBeenCalled();
+    const anchor = appendSpy.mock.calls[0][0];
+    expect(anchor.tagName).toBe('A');
+    expect(anchor.download).toBe('my-route.gpx');
+    expect(anchor.href).toMatch(/^data:application\/gpx\+xml;charset=utf-8,/);
+    expect(clickSpy).toHaveBeenCalled();
+    expect(removeSpy).toHaveBeenCalled();
   });
 
   it('defaults filename to "kakao-route.gpx"', () => {
     downloadGPX(generateGPX(SAMPLE_POINTS));
-    expect(tm.downloads[0].filename).toBe('kakao-route.gpx');
+    const anchor = appendSpy.mock.calls[0][0];
+    expect(anchor.download).toBe('kakao-route.gpx');
   });
 
-  it('falls back to an <a> element when GM_download is unavailable', () => {
-    tm.uninstall();
-    delete global.GM_download;
+  it('produces a data URI that decodes to valid GPX content', () => {
+    const gpx = generateGPX(SAMPLE_POINTS);
+    downloadGPX(gpx, 'route.gpx');
 
-    const appendSpy = jest.spyOn(document.body, 'appendChild');
-    const removeSpy = jest.spyOn(document.body, 'removeChild');
-
-    downloadGPX(generateGPX(SAMPLE_POINTS), 'route.gpx');
-
-    expect(appendSpy).toHaveBeenCalled();
-    const anchorArg = appendSpy.mock.calls[0][0];
-    expect(anchorArg.tagName).toBe('A');
-    expect(anchorArg.download).toBe('route.gpx');
-    expect(anchorArg.href).toMatch(/^data:application\/gpx\+xml;charset=utf-8,/);
-    expect(removeSpy).toHaveBeenCalled();
-
-    appendSpy.mockRestore();
-    removeSpy.mockRestore();
+    const anchor = appendSpy.mock.calls[0][0];
+    const decoded = decodeURIComponent(anchor.href.replace(/^data:[^,]+,/, ''));
+    expect(decoded).toContain('<?xml');
+    expect(decoded).toContain('<trkpt');
+    expect(decoded).toContain('lat="37.5665"');
   });
 });
 
 // ── Full integration: button click triggers GPX download ──────────────────
 
 describe('Integration: Export GPX button click', () => {
-  let tm;
+  let appendSpy;
+  let removeSpy;
+  let clickedAnchors;
 
   beforeEach(() => {
-    tm = new TampermonkeyMock();
-    tm.install();
     global.alert = jest.fn();
     document.body.innerHTML = '';
+
+    // Track anchors that were clicked (the actual download trigger).
+    clickedAnchors = [];
+    appendSpy = jest.spyOn(document.body, 'appendChild').mockImplementation(function (el) {
+      // Record anchor elements that look like download triggers.
+      if (el.tagName === 'A' && el.download) {
+        clickedAnchors.push({ href: el.href, download: el.download });
+      }
+      return HTMLElement.prototype.appendChild.call(document.body, el);
+    });
+    removeSpy = jest.spyOn(document.body, 'removeChild');
   });
 
   afterEach(() => {
-    tm.uninstall();
+    appendSpy.mockRestore();
+    removeSpy.mockRestore();
   });
 
   it('downloads a GPX file when route data is available in global state', () => {
@@ -967,8 +988,8 @@ describe('Integration: Export GPX button click', () => {
     addExportButton(document, win);
     document.getElementById('kakao-gpx-export-btn').click();
 
-    expect(tm.downloads).toHaveLength(1);
-    expect(tm.downloads[0].filename).toBe('kakao-route.gpx');
+    expect(clickedAnchors).toHaveLength(1);
+    expect(clickedAnchors[0].download).toBe('kakao-route.gpx');
   });
 
   it('downloads a GPX file when route is captured via XHR hook', () => {
@@ -980,8 +1001,8 @@ describe('Integration: Export GPX button click', () => {
     addExportButton(document, win);
     document.getElementById('kakao-gpx-export-btn').click();
 
-    expect(tm.downloads).toHaveLength(1);
-    expect(tm.downloads[0].filename).toBe('kakao-route.gpx');
+    expect(clickedAnchors).toHaveLength(1);
+    expect(clickedAnchors[0].download).toBe('kakao-route.gpx');
   });
 
   it('downloads a valid GPX file that contains the expected coordinates', () => {
@@ -993,9 +1014,9 @@ describe('Integration: Export GPX button click', () => {
     addExportButton(document, win);
     document.getElementById('kakao-gpx-export-btn').click();
 
-    // GM_download should have been called with a data URI.
-    expect(tm.downloads).toHaveLength(1);
-    const dataUri = tm.downloads[0].url;
+    // The anchor should have a data URI with GPX content.
+    expect(clickedAnchors).toHaveLength(1);
+    const dataUri = clickedAnchors[0].href;
     expect(dataUri).toMatch(/^data:application\/gpx\+xml;charset=utf-8,/);
 
     // Decode the data URI and verify it contains GPX track points.
@@ -1016,7 +1037,7 @@ describe('Integration: Export GPX button click', () => {
     expect(global.alert).toHaveBeenCalledWith(
       expect.stringContaining('No route data found')
     );
-    expect(tm.downloads).toHaveLength(0);
+    expect(clickedAnchors).toHaveLength(0);
   });
 
   it('downloads GPX when internal Kakao route is captured via XHR hook then button is clicked', () => {
@@ -1024,7 +1045,7 @@ describe('Integration: Export GPX button click', () => {
     //   1. Page loads and the Tampermonkey network hook intercepts /route/bikeset.json
     //   2. User opens the route page, which triggers the XHR, populating __kakaoGPXRawRoute
     //   3. User clicks "Export GPX" — collectRoute converts WCONGNAMUL via kakao.maps.Coords
-    //      and generateGPX/downloadGPX produce the output
+    //      and generateGPX/downloadGPX produce the output via <a download>
 
     // Build a fake XHR harness.
     const xhrListeners = [];
@@ -1062,13 +1083,13 @@ describe('Integration: Export GPX button click', () => {
     addExportButton(document, win);
     document.getElementById('kakao-gpx-export-btn').click();
 
-    // The download should have been triggered (no alert, one download entry).
+    // The download should have been triggered via <a download> (no alert).
     expect(global.alert).not.toHaveBeenCalled();
-    expect(tm.downloads).toHaveLength(1);
-    expect(tm.downloads[0].filename).toBe('kakao-route.gpx');
+    expect(clickedAnchors).toHaveLength(1);
+    expect(clickedAnchors[0].download).toBe('kakao-route.gpx');
 
-    // The URL should be a data URI containing valid GPX.
-    const dataUri = tm.downloads[0].url;
+    // The href should be a data URI containing valid GPX with WGS84 coords.
+    const dataUri = clickedAnchors[0].href;
     expect(dataUri).toMatch(/^data:application\/gpx\+xml;charset=utf-8,/);
     const gpxContent = decodeURIComponent(dataUri.replace(/^data:[^,]+,/, ''));
     expect(gpxContent).toContain('<trkpt');
